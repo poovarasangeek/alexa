@@ -1,0 +1,28 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model files (Too large for GitHub)
+*.onnx
+*.bin
+*.pt
+
+# Audio files
+*.wav
+*.mp3
+
+# Test scripts
+test_*.py
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
