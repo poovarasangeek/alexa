@@ -87,5 +87,4 @@ Chat "Hello", "How are you?", "Who are you?"
 
 · openWakeWord for wake word detection.
 · Faster-Whisper for speech recognition.
-· Piper for text-to-speech.
-```
+· Piper for text-to-speech.```
