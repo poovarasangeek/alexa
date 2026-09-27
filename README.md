@@ -20,7 +20,6 @@ A fully offline, fast, and privacy-focused voice assistant for Linux. It uses **
    ```bash
    git clone https://github.com/YOUR_USERNAME/alexa.git
    cd alexa
-```
 
 1. Create and activate a virtual environment:
    ```bash
