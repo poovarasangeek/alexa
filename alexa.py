@@ -1,31 +1,41 @@
 """
-Alexa main loop — openWakeWord edition, no LLM.
+Alexa main loop — openWakeWord + Moonshine + Qwen 2.5 1.5B.
 
-Wake detection runs a lightweight always-on keyword spotter
-(openWakeWord, "alexa" model). Whisper only runs AFTER the wake word fires.
-Commands are routed through intent classification + dispatcher.
-Unknown commands get a fixed spoken fallback (no LLM / Ollama).
+- Wake detection: openWakeWord ("alexa" model)
+- STT: Moonshine Base (batch transcription via transcribe_without_streaming)
+- Intent: regex-first via intent.py, LLM fallback (Qwen 1.7B) for fuzzy phrases
+- Conversational fallback: Qwen 2.5 1.5B via Ollama
+- TTS: Piper
 
 Install:
-    pip install openwakeword faster-whisper sounddevice scipy piper-tts
+    pip install openwakeword moonshine-voice sounddevice scipy piper-tts requests
 
-Wake word model file needed:
-    ~/alexa/wakeword/alexa_v0.1.onnx
+Download Moonshine model (one-time):
+    python -m moonshine_voice.download --language en
+
+Pull Qwen models:
+    ollama pull qwen3:1.7b
+    ollama pull qwen2.5:1.5b
 """
 
 import os
 import re
 import time
 import queue
+import json
 import tempfile
 import subprocess
 import wave
+
+
 import numpy as np
+import requests
 import sounddevice as sd
 from scipy.io.wavfile import write
-from faster_whisper import WhisperModel
 from openwakeword.model import Model as OWWModel
 from piper.voice import PiperVoice
+
+from moonshine_voice import Transcriber, ModelArch, get_model_for_language
 
 from intent import classify
 from dispatcher import execute
@@ -35,8 +45,13 @@ from dispatcher import execute
 # ALEXA CONFIGURATION
 # =========================
 
+_conversation_history = []
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "tomng/lfm2.5-instruct:1.2b-q8_0"   # conversational fallback
+
 PIPER_MODEL = os.path.expanduser(
-    "~/alexa/voices/en_US-hfc_female-medium.onnx"
+    "~/alexa/voices/en_GB-jenny_dioco-medium.onnx"
 )
 
 SAMPLE_RATE = 16000
@@ -48,33 +63,38 @@ WAKEWORD_CONFIRM_FRAMES = 3
 WAKEWORD_MIN_RMS = 250
 
 # --- Silence-based recording (VAD) settings ---
-VAD_SILENCE_RMS = 300          # tuned for normal-gain mics; see debug prints
-VAD_SILENCE_DURATION = 0.3     # wait this long after you stop speaking
+VAD_SILENCE_RMS = 900
+VAD_SILENCE_DURATION = 0.3 #was 3
 VAD_MAX_SECONDS = 8
 VAD_MIN_SPEECH_SECONDS = 0.6
 VAD_NO_SPEECH_TIMEOUT = 5.0
 
-# --- Debug flags ---
-DEBUG_AUDIO = True             # set False once everything works
+DEBUG_AUDIO = True
 
 
 # =========================
 # MODELS
 # =========================
 
-whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
 oww = OWWModel(wakeword_model_paths=[WAKEWORD_MODEL])
-_voice=PiperVoice.load(PIPER_MODEL)        # <-- ADD THIS LINE
+
+
+print("Loading Moonshine model...")
+model_path, model_arch = get_model_for_language("en")
+moonshine = Transcriber(
+    model_path=model_path,
+    model_arch=model_arch,
+)
+print("Moonshine loaded.")
+
+_voice = PiperVoice.load(PIPER_MODEL)
+
 
 # =========================
 # TEXT TO SPEECH
 # =========================
 
 def _split_into_chunks(text: str) -> list:
-    """
-    Break a response into speakable chunks: split on line breaks and
-    sentence boundaries so Piper can start speaking immediately.
-    """
     chunks = []
     for line in text.splitlines():
         line = line.strip()
@@ -86,7 +106,6 @@ def _split_into_chunks(text: str) -> list:
 
 
 def _speak_chunk(text: str):
-    """Synthesize and play a single chunk using the in-memory Piper model."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         wav_file = f.name
     try:
@@ -137,10 +156,11 @@ def _audio_callback(indata, frames, time_info, status):
 # RECORD MICROPHONE
 # =========================
 
-def record_audio() -> str:
+def record_audio() -> np.ndarray:
     """
     Records until end-of-speech is detected via RMS-based VAD.
-    Assumes _recording_command was set True by main() BEFORE calling.
+    Returns a float32 numpy array (mono, 16kHz, -1.0 to 1.0)
+    ready for Moonshine.
     """
     global _recording_command
     print("🎤 Listening...")
@@ -154,14 +174,14 @@ def record_audio() -> str:
     consecutive_silence = 0
     total_frames = 0
     speech_started = False
-
     t_start = time.time()
 
     while total_frames < max_frames:
         try:
             frame = command_q.get(timeout=1.0)
         except queue.Empty:
-            print("  [rec] ⚠️ queue empty for 1s — callback may be dead")
+            if DEBUG_AUDIO:
+                print("  [rec] ⚠️ queue empty for 1s")
             continue
 
         frames.append(frame)
@@ -179,57 +199,58 @@ def record_audio() -> str:
         elif speech_started:
             consecutive_silence += 1
 
-        # End-of-speech
         if (speech_started
                 and total_frames >= min_speech_frames
                 and consecutive_silence >= silence_frames_needed):
-            print(f"  [rec] end-of-speech after {total_frames} frames")
+            if DEBUG_AUDIO:
+                print(f"  [rec] end-of-speech after {total_frames} frames")
             break
 
-        # No speech at all
         if not speech_started and total_frames >= no_speech_timeout_frames:
-            print("  [rec] no speech detected, bailing")
+            if DEBUG_AUDIO:
+                print("  [rec] no speech detected, bailing")
             break
 
-        # Safety cap on total duration
         if time.time() - t_start > VAD_MAX_SECONDS:
-            print("  [rec] hit wall-clock cap, bailing")
+            if DEBUG_AUDIO:
+                print("  [rec] wall-clock cap, bailing")
             break
 
     _recording_command = False
 
-    audio = (np.concatenate(frames)
-             if frames else np.zeros(FRAME_SAMPLES, dtype=np.int16))
+    if frames:
+        audio_int16 = np.concatenate(frames)
+    else:
+        audio_int16 = np.zeros(FRAME_SAMPLES, dtype=np.int16)
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        filename = f.name
-    write(filename, SAMPLE_RATE, audio)
+    audio_float = audio_int16.astype(np.float32) / 32768.0
 
-    dur = len(audio) / SAMPLE_RATE
-    peak = int(np.max(np.abs(audio))) if audio.size else 0
-    avg_rms = _frame_rms(audio.astype(np.int16)) if audio.size else 0.0
+    dur = len(audio_float) / SAMPLE_RATE
+    peak = int(np.max(np.abs(audio_int16))) if audio_int16.size else 0
+    avg_rms = _frame_rms(audio_int16) if audio_int16.size else 0.0
     print(f"  [rec] done: {dur:.2f}s peak={peak} avg_rms={avg_rms:.0f}")
 
-    return filename
+    return audio_float
 
 
 # =========================
-# TRANSCRIBE
+# TRANSCRIBE (Moonshine)
 # =========================
 
-def transcribe(filename):
-    segments, info = whisper.transcribe(
-        filename,
-        beam_size=1,
-        condition_on_previous_text=False,
-        vad_filter=True,
-        best_of=1,
-        temperature=0.0,
-        without_timestamps=True,
-    )
-    text = " ".join(seg.text for seg in segments).strip().lower()
-    print(f"  [asr] duration={info.duration:.2f}s text='{text}'")
-    return text
+def transcribe(audio_float: np.ndarray) -> str:
+    if audio_float.size == 0:
+        return ""
+    try:
+        transcript = moonshine.transcribe_without_streaming(
+            audio_data=audio_float.tolist(),
+            sample_rate=SAMPLE_RATE,
+        )
+        text = " ".join(line.text for line in transcript.lines).strip().lower()
+        print(f"  [asr] text='{text}'")
+        return text
+    except Exception as e:
+        print(f"  [asr] Moonshine error: {e}")
+        return ""
 
 
 def remove_wake_word(text):
@@ -238,17 +259,125 @@ def remove_wake_word(text):
 
 
 # =========================
-# COMMAND HANDLING (no LLM)
+# ASK QWEN 2.5 1.5B (conversational fallback)
+# =========================
+
+def ask_alexa_stream(question: str):
+    """
+    Sends the question to Ollama, streams the response token by token,
+    and speaks each completed sentence immediately. Now with memory!
+    """
+    global _conversation_history
+    
+    # Add the new user question to memory
+    _conversation_history.append({"role": "user", "content": question})
+    
+    # Keep only the last 6 messages (3 exchanges) to prevent context overload
+    history = _conversation_history[-6:]
+    
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Alexa, a friendly voice assistant. "
+                "Give concise answers suitable for speech. "
+                "Do not use markdown. Keep responses under 2 sentences."
+            ),
+        },
+        *history
+    ]
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "stream": True,       # <--- CRITICAL: Enable streaming!
+                "think": False,
+                "options": {
+                    "temperature": 0.5, #was 0.7 #0.3 used
+                    "num_predict": 60,  #was 120
+                    "top_k": 50,       #new #was 20
+                    "repeat_penalty": 1.05, #new
+                },
+            },
+            stream=True,              # <--- CRITICAL: Tell requests to stream
+            timeout=30,
+        )
+
+        buffer = ""
+        full_reply = "" # <-- Tracks the entire response for memory
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line.decode("utf-8"))
+                token = chunk.get("message", {}).get("content", "")
+                if not token:
+                    continue
+
+                buffer += token
+                full_reply += token # <-- Add token to full reply
+
+                # Check if we hit a sentence boundary (. ! ?)
+                match = re.search(r'([.!?])(\s+|$)', buffer)
+                if match:
+                    end_idx = match.end(1)  # End of the punctuation
+                    to_speak = buffer[:end_idx].strip()
+                    buffer = buffer[end_idx:]
+
+                    if to_speak:
+                        print(f"Alexa (streaming): {to_speak}")
+                        _speak_chunk(to_speak)
+
+            except json.JSONDecodeError:
+                continue
+
+        # Speak any remaining text that didn't end with punctuation
+        if buffer.strip():
+            print(f"Alexa (streaming): {buffer.strip()}")
+            _speak_chunk(buffer.strip())
+            
+        # Add the assistant's full reply to memory
+        if full_reply.strip():
+            _conversation_history.append({"role": "assistant", "content": full_reply.strip()})
+
+    except Exception as e:
+        print("Ollama error:", e)
+        speak("Sorry, I couldn't connect to my brain.")
+
+# =========================
+# COMMAND HANDLING
 # =========================
 
 def handle_command(command: str):
+    global _last_response_time
+    _last_response_time = time.time()
+
+    # Split the command on "and", "then", or commas
+    parts = re.split(r"\band\b|\bthen\b|,", command)
+
+    # Clean up any empty spaces and remove empty strings
+    parts = [p.strip() for p in parts if p.strip()]
+
+    if len(parts) > 1:
+        print(f"  [seq] Detected sequence: {parts}")
+        for part in parts:
+            _handle_single_command(part)
+    else:
+        _handle_single_command(command)
+
+
+def _handle_single_command(command: str):
     intent = classify(command)
     print(f"  [intent] {intent}")
+
     if intent.get("intent") not in (None, "unknown"):
         response = execute(intent)
+        speak(response)
     else:
-        response = "Sorry, I don't know that one yet."
-    speak(response)
+        ask_alexa_stream(command)
 
 
 # =========================
@@ -304,7 +433,6 @@ def main():
     print()
 
     with sd.InputStream(
-        device=15,
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="int16",
@@ -317,22 +445,16 @@ def main():
             _recording_command = False
             wait_for_wake_word()
 
-            # Begin capturing command audio immediately.
             _listening_for_wake = False
             _recording_command = True
 
             t0 = time.time()
-            filename = record_audio()
+            audio = record_audio()
             print(f"  [main] record_audio returned in {time.time()-t0:.2f}s")
 
             t0 = time.time()
-            command = transcribe(filename)
+            command = transcribe(audio)
             print(f"  [main] transcribe took {time.time()-t0:.2f}s")
-
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
 
             if not command:
                 speak("I didn't hear anything.")
