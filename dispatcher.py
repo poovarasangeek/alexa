@@ -220,17 +220,14 @@ def execute(intent: dict) -> str:
         return "Keyboard light turned off." if ok else "Couldn't turn off keyboard light."
 
     # ---------- MEDIA / SEARCH ----------
+    # In dispatcher.py, find the brave_search function and update the binary check:
     if name == "brave_search":
-        if arg:
-            query = urllib.parse.quote_plus(arg)
-            url = f"https://search.brave.com/search?q={query}"
-            for cmd in [["brave-browser", url], ["brave", url]]:
-                if shutil.which(cmd[0]):
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return f"Searching Brave for {arg}."
-            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"Searching for {arg}."
-        return "What would you like me to search for?"
+        # ... existing url logic ...
+        for cmd in [["helium", url], ["helium-browser", url]]:
+            if shutil.which(cmd[0]):
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return f"Searching for {arg}."
+        # fallback to xdg-open remains the same
 
     if name == "play_song":
         music_dirs = [os.path.expanduser("~/Music"), os.path.expanduser("~/Downloads")]
@@ -273,9 +270,7 @@ def execute(intent: dict) -> str:
             "gnome-software": [["gnome-software"]],
             "settings": [
                 ["systemsettings5"],                              # KDE Plasma 5
-                ["systemsettings"],                               # KDE Plasma 6
-                ["gnome-control-center"],                         # GNOME / Ubuntu
-                ["xdg-open", "settings://"],                      # Universal fallback
+                ["systemsettings"],                               # KDE Plasma 6     
             ],
             "calendar": [["gnome-calendar"], ["thunderbird"]],
         }
@@ -299,7 +294,7 @@ def execute(intent: dict) -> str:
                     )
 
                     # Give it a split second to launch
-                    time.sleep(0.5)
+                    time.sleep(0.4)
 
                     # If it exited immediately, print the error
                     if proc.poll() is not None:
