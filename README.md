@@ -326,10 +326,13 @@ To swap the voice, change `PIPER_MODEL`; to change the brain, change the `llama-
 
 ## License
 
-Anyone may use, copy, modify, merge, publish, distribute, and sell copies of this
-software — the only condition is that **my name (Poovarasan) and this permission
-notice stay with the code**. In legal terms this is the **MIT License**, see the
-[`LICENSE`](LICENSE) file.
+Licensed under the **Apache License, Version 2.0** — see the [`LICENSE`](LICENSE) file.
 
-> In short: use it freely, just keep my name on it.
+In plain terms: you may use, copy, modify, merge, publish, distribute, sublicense,
+and sell copies of this software freely. The conditions are simply that you
+**keep my name (Poovarasan) and the license/attribution notices with the code**,
+mark any files you change, and include a copy of the license with redistributions.
+Apache 2.0 also grants an explicit patent license from every contributor.
+
+> In short: use it freely, just keep my name on it. 💜
 <p align="center"><sub>Built locally, for local use. No clouds were harmed. 💜 — Poovarasan</sub></p>
