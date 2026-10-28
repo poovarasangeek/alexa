@@ -1,6 +1,6 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)]()
+![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey)
 # 🎙️ Alexa — 100% Local Voice Assistant
 
 A private, offline‑first voice assistant for Linux that runs entirely on your own hardware.
